@@ -1,0 +1,5 @@
+# GSVT
+
+GSVT (Go Sqlite Vector Topper) is an add-on library that utilizes SQLite as a vector search engine, *sort of*. It's for small client-side applications where the total set of vectors being searched across can be loaded into memory, searched, and then unloaded. It is less efficient than a direct vector database. Why use this then? Simplicity and ease of deployment. The end-user doesn't need to load any plugins or configure database specific configurations as would be needed in sqlite-vss or pgvector.
+
+This application is a set of tooling that sits on top of a SQLite instance, creates and manages migrations of tables based on a specified schema, and provides a set of functions for searching across the vectors. This metadata-filter-first approach; It performs a sqlite search across the metadata of the request first, then loads all of the selected vectors into memory, and finally performs the specified similarity comparison, returning a ranked list of results.
