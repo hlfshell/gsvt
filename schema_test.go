@@ -45,14 +45,13 @@ func TestSchemaCreationAndExtraction(t *testing.T) {
 
 	// Now we create the schema in the SQL database
 	query := schema.CreateTableSQL()
-	fmt.Println(query)
+
 	_, err = db.Exec(query)
 	require.Nil(t, err)
 
 	// Create the indexes as well
 	for _, index := range schema.Indexes {
 		query := index.CreateIndexSQL(schema.Name)
-		fmt.Println(query)
 		_, err = db.Exec(query)
 		require.Nil(t, err)
 	}

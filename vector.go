@@ -3,9 +3,9 @@ package gsvt
 import (
 	"encoding/binary"
 	"math"
-	"sync"
 
 	"github.com/drewlanenga/govector"
+	"golang.org/x/sync/errgroup"
 )
 
 const COSINE = 0
@@ -18,11 +18,21 @@ type Vector struct {
 }
 
 type SimilarityOptions struct {
-	Method  int
+	// Method defines which method is applicable. Expected
+	// values is one of these constants:
+	// COSINE, EUCLIDEAN, DOT_PRODUCT
+	Method int
+
+	// Workers is how many workers to use when calculating
+	// the similarity. This value needs to be at least 1
+	// or higher. If the values returned needing similarity
+	// calculations is less than the number of workers, then
+	// we ignore this and use the number of returned values
+	// instead.
 	Workers int
 }
 
-var DEFAULTOPTIONS *SimilarityOptions = &SimilarityOptions{
+var DefaultSimilarityOptions *SimilarityOptions = &SimilarityOptions{
 	Method:  COSINE,
 	Workers: 50,
 }
@@ -37,17 +47,17 @@ out to N workers for a speed-up
 
 If the options aren't specified, DEFAULTOPTIONS will be used.
 */
-func (v *Vector) SimilarityToVectorSet(vectors []*Vector, options *SimilarityOptions) []float64 {
+func (v *Vector) SimilarityToVectorSet(vectors []*Vector, options *SimilarityOptions) ([]float64, error) {
 	if options == nil {
-		options = DEFAULTOPTIONS
+		options = DefaultSimilarityOptions
 	}
 	if options.Workers == 0 {
-		options.Workers = DEFAULTOPTIONS.Workers
+		options.Workers = DefaultSimilarityOptions.Workers
 	}
 
 	similarities := make([]float64, len(vectors))
-	indexChannel := make(chan int) //, options.Workers)
-	var wait sync.WaitGroup
+	indexChannel := make(chan int)
+	var group errgroup.Group
 
 	workers := options.Workers
 	if workers > len(vectors) {
@@ -55,35 +65,38 @@ func (v *Vector) SimilarityToVectorSet(vectors []*Vector, options *SimilarityOpt
 	}
 
 	for i := 0; i < workers; i++ {
-		go func() {
+		group.Go(func() error {
 			for index := range indexChannel {
-				similarities[index] = v.SimilarityToVector(vectors[index], options)
-				wait.Done()
+				similarity, err := v.SimilarityToVector(vectors[index], options)
+				if err != nil {
+					return nil
+				}
+				similarities[index] = similarity
 			}
-		}()
+			return nil
+		})
 	}
 
 	for index, _ := range vectors {
-		wait.Add(1)
 		indexChannel <- index
 	}
-
 	close(indexChannel)
-	wait.Wait()
 
-	// For now do it the serial method - do worker queue
-	// in a bit
-	for i, vector := range vectors {
-		similarities[i] = v.SimilarityToVector(vector, options)
+	if err := group.Wait(); err != nil {
+		return nil, err
 	}
 
-	return similarities
+	return similarities, nil
 }
 
 // SimilarityToVector - Given a vector, find its similarity
 // w/ the specified method. If the options aren't specified,
 // DEFAULTOPTIONS will be used.
-func (v *Vector) SimilarityToVector(other *Vector, options *SimilarityOptions) float64 {
+func (v *Vector) SimilarityToVector(other *Vector, options *SimilarityOptions) (float64, error) {
+	if options == nil {
+		options = DefaultSimilarityOptions
+	}
+
 	switch options.Method {
 	case COSINE:
 		return v.cosineSimilarity(other)
@@ -96,16 +109,18 @@ func (v *Vector) SimilarityToVector(other *Vector, options *SimilarityOptions) f
 	}
 }
 
-func (v *Vector) cosineSimilarity(vector *Vector) float64 {
-	return 0.0
+func (v *Vector) cosineSimilarity(vector *Vector) (float64, error) {
+	similarity, err := govector.Cosine(v.Vector, vector.Vector)
+	return similarity, err
 }
 
-func (v *Vector) euclideanDistance(vector *Vector) float64 {
-	return 0.0
+func (v *Vector) euclideanDistance(vector *Vector) (float64, error) {
+	// sum = v.Vector.Pow(2) + vector.Vector.Pow(2)
+	return 0.0, nil
 }
 
-func (v *Vector) dotProduct(vector *Vector) float64 {
-	return 0.0
+func (v *Vector) dotProduct(vector *Vector) (float64, error) {
+	return govector.DotProduct(v.Vector, vector.Vector)
 }
 
 // ToBytes - Convert the vector to a byte array

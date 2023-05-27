@@ -3,7 +3,9 @@ package gsvt
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"sort"
+	"time"
 
 	"github.com/drewlanenga/govector"
 )
@@ -22,17 +24,33 @@ type VectorConfig struct {
 
 type Filter struct {
 	Metadata []ColumnFilter
-	Options  QueryOptions
+}
+
+type FilterOptions struct {
+	SimilarityOptions *SimilarityOptions
+
+	// StdDeviations is how many standard deviations
+	// to accept as a high likelihood match. If this
+	// is set to 0 then it will be ignored. By default
+	// the value should be ~ 1.5. However, if you have
+	// a low number of samples total, it's possible
+	// that you will wish to ignore this feature.
+	StdDeviations float64
+
+	// Limit is how many vectors max to return
+	Limit int
+}
+
+var DefaultFilterOptions FilterOptions = FilterOptions{
+	SimilarityOptions: DefaultSimilarityOptions,
+	StdDeviations:     1.5,
+	Limit:             0,
 }
 
 type ColumnFilter struct {
 	Column    string
 	Operation string
 	Value     interface{}
-}
-
-type QueryOptions struct {
-	Limit int
 }
 
 func NewDB(db *sql.DB, schema *Schema, config *VectorConfig) *DB {
@@ -88,8 +106,7 @@ func (db *DB) Migrate() error {
 
 func (db *DB) createTable() error {
 	query := db.schema.CreateTableSQL()
-	fmt.Println("EXECUTE CREATE TABLE")
-	fmt.Println(query)
+
 	_, err := db.db.Exec(query)
 	if err != nil {
 		return err
@@ -183,13 +200,12 @@ func (db *DB) Insert(vector *Vector) error {
 			values = append(values, vector.Metadata[column.Name])
 		}
 	}
-	placeholderString := fmt.Sprintf("(%s)", placeholders)
 
 	query := fmt.Sprintf(
 		`INSERT INTO %s (%s) VALUES (%s)`,
 		db.schema.Name,
 		columnNames,
-		placeholderString,
+		placeholders,
 	)
 
 	// Execute the query
@@ -198,6 +214,13 @@ func (db *DB) Insert(vector *Vector) error {
 }
 
 func (db *DB) validateQueryFilter(filter *Filter) error {
+	// The filter can be nil - this means we're essentially
+	// doing a SELECT ALL on our vectors. Less than ideal, but
+	// possible and allowed.
+	if filter == nil {
+		return nil
+	}
+
 	// Ensure that the filter only uses columns that exist
 	// within the schema
 	allColumnNames := map[string]bool{}
@@ -234,7 +257,11 @@ func (db *DB) rowsToVectors(rows *sql.Rows) ([]*Vector, error) {
 			Vector:   govector.Vector{},
 		}
 
+		values := make([]interface{}, len(columns))
 		results := make([]interface{}, len(columns))
+		for i := range results {
+			results[i] = &values[i]
+		}
 		err := rows.Scan(results...)
 		if err != nil {
 			return nil, err
@@ -244,11 +271,36 @@ func (db *DB) rowsToVectors(rows *sql.Rows) ([]*Vector, error) {
 		// their values to the vector
 		for index, column := range columns {
 			if column == VECTOR_COLUMN_NAME {
-				fmt.Println("converting from bytes")
-				bytes := results[index].([]byte)
+				bytes := (values[index]).([]byte)
+				// bytes := (*(results[index].(*interface{}))).([]byte)
 				vector.FromBytes(bytes)
 			} else {
-				vector.Metadata[column] = results[index]
+				// Attempt to conver to the correct type
+				// for easier use
+				// Find the column in the schema
+				matched := false
+				for _, schemaColumn := range db.schema.Columns {
+					if schemaColumn.Name == column {
+						matched = true
+						switch schemaColumn.Type {
+						case "INTEGER":
+							vector.Metadata[column] = (values[index]).(int64)
+						case "REAL":
+							vector.Metadata[column] = (values[index]).(float64)
+						case "TEXT":
+							vector.Metadata[column] = (values[index]).(string)
+						case "BLOB":
+							vector.Metadata[column] = (values[index]).([]byte)
+						case "TIMESTAMP":
+							vector.Metadata[column] = (values[index]).(time.Time)
+						}
+						break
+					}
+				}
+				// Failsafe if type is unrecognized
+				if !matched {
+					vector.Metadata[column] = results[index]
+				}
 			}
 		}
 
@@ -260,7 +312,9 @@ func (db *DB) rowsToVectors(rows *sql.Rows) ([]*Vector, error) {
 
 // Query will return a set of vectors that match the
 // given filter via its metadata (you can not search)
-// on the vector iself).
+// on the vector iself). If the filter is nil then you
+// are recalling all vectors - not recommended but
+// possible for smaller datasets
 func (db *DB) Query(filter *Filter) ([]*Vector, error) {
 	if err := db.validateQueryFilter(filter); err != nil {
 		return nil, err
@@ -278,7 +332,7 @@ func (db *DB) Query(filter *Filter) ([]*Vector, error) {
 	// Build up our query
 	var query string
 	whereValues := []interface{}{}
-	if filter.Metadata != nil && len(filter.Metadata) != 0 {
+	if filter != nil && filter.Metadata != nil && len(filter.Metadata) != 0 {
 		// Build our WHERE statement via the filter
 		whereClause := ""
 		for index, column := range filter.Metadata {
@@ -316,33 +370,84 @@ func (db *DB) Query(filter *Filter) ([]*Vector, error) {
 	return db.rowsToVectors(rows)
 }
 
-func (db *DB) QuerySimilarity(target *Vector, filter *Filter, options *SimilarityOptions) ([]*Vector, error) {
+func (db *DB) QuerySimilarity(target *Vector, filter *Filter, options *FilterOptions) ([]*Vector, []float64, error) {
 	if options == nil {
-		options = DEFAULTOPTIONS
+		options = &DefaultFilterOptions
 	}
 
 	// First we get the vectors that match the filter
 	vectors, err := db.Query(filter)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Then we calculate the similarity to the target vector
-	distances := target.SimilarityToVectorSet(vectors, options)
-
-	// Then we sort the vectors by their distance
-	// to the target vector
-	sortedVectors := []*Vector{}
-
-	sort.SliceStable(vectors, func(a int, b int) bool {
-		return distances[a] < distances[b]
-	})
-
-	// If the limit is 0, we can return now
-	if filter.Options.Limit == 0 {
-		return sortedVectors, nil
+	similarities, err := target.SimilarityToVectorSet(vectors, options.SimilarityOptions)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	// ...otherwise, return the limit
-	return sortedVectors[0:filter.Options.Limit], nil
+	// Then we sort the vectors by their distance
+	// to the target vector. We need to create a map
+	// to track association between similarity scores
+	// and the associated vector
+	sortMap := map[*Vector]float64{}
+	for index, vector := range vectors {
+		sortMap[vector] = similarities[index]
+	}
+
+	sort.Slice(vectors, func(a int, b int) bool {
+		return sortMap[vectors[a]] > sortMap[vectors[b]]
+	})
+
+	// Similarly, we want the similarity scores to be
+	// sorted; since we have the sortMap, we don't
+	// need to worry about sorting again
+	sortedSimilarities := make([]float64, len(similarities))
+	for index, vector := range vectors {
+		sortedSimilarities[index] = sortMap[vector]
+	}
+
+	// If the std dev is not 0, we need to find outliers
+	// and filter
+	if options.StdDeviations > 0 {
+		mean, stdDev := meanAndStandardDeviation(sortedSimilarities)
+		outlier := mean + (options.StdDeviations * stdDev)
+
+		// Find the index of the first non outlier
+		cutoffIndex := 0
+		for index, similarity := range sortedSimilarities {
+			if similarity < outlier {
+				cutoffIndex = index
+				break
+			}
+		}
+
+		// Filter out non-outliers
+		vectors = vectors[0:cutoffIndex]
+		sortedSimilarities = sortedSimilarities[0:cutoffIndex]
+	}
+
+	// If the limit is 0, we can return now
+	if options.Limit == 0 {
+		return vectors, sortedSimilarities, nil
+	} else {
+		return vectors[0:options.Limit], sortedSimilarities[0:options.Limit], nil
+	}
+}
+
+func meanAndStandardDeviation(values []float64) (float64, float64) {
+	mean := 0.0
+	for _, value := range values {
+		mean += value
+	}
+	mean /= float64(len(values))
+
+	variance := 0.0
+	for _, value := range values {
+		variance += math.Pow(value-mean, 2)
+	}
+	variance /= float64(len(values))
+
+	return mean, math.Sqrt(variance)
 }

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/drewlanenga/govector"
+	"github.com/stretchr/testify/require"
 )
 
 func TestVectorSimilarity(t *testing.T) {
@@ -22,7 +23,8 @@ func TestVectorSimilarity(t *testing.T) {
 		Workers: 4,
 	}
 
-	similarities := baseVector.SimilarityToVectorSet(vectors, options)
+	similarities, err := baseVector.SimilarityToVectorSet(vectors, options)
+	require.Nil(t, err)
 
 	for _, similarity := range similarities {
 		if similarity != 1.0 {
