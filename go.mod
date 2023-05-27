@@ -6,6 +6,7 @@ require (
 	github.com/drewlanenga/govector v0.0.0-20220726163947-b958ac08bc93
 	github.com/mattn/go-sqlite3 v1.14.16
 	github.com/stretchr/testify v1.8.3
+	golang.org/x/sync v0.2.0
 )
 
 require (
